@@ -30,6 +30,7 @@ mod bedrock_guardrails;
 mod google_model_armor;
 mod moderation;
 mod pii;
+mod straiker;
 pub mod streaming_guardrails;
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -959,6 +960,9 @@ impl Policy {
 				Self::evaluate_azure_content_safety_request(req, claims, client, acs, &guard.rejection)
 					.await
 			},
+			RequestGuardKind::Straiker(st) => {
+				Self::evaluate_straiker_request(req, http_headers, client, st, &guard.rejection).await
+			},
 		}
 	}
 
@@ -974,6 +978,46 @@ impl Policy {
 			Ok(GuardrailOutcome::Rejected(rejection.as_response()))
 		} else {
 			Ok(GuardrailOutcome::None)
+		}
+	}
+
+	async fn evaluate_straiker_request(
+		req: &mut dyn RequestType,
+		http_headers: &HeaderMap,
+		client: &PolicyClient,
+		straiker: &Straiker,
+		rejection: &RequestRejection,
+	) -> anyhow::Result<GuardrailOutcome<RequestGuardMutation>> {
+		match straiker::send_request(req, client, straiker, http_headers).await {
+			Ok(v) if v.is_block() => Ok(GuardrailOutcome::Rejected(rejection.as_response())),
+			Ok(_) => Ok(GuardrailOutcome::None),
+			Err(e) => match straiker.failure_mode {
+				FailureMode::FailOpen => {
+					warn!("straiker guardrail unavailable, failing open: {}", e);
+					Ok(GuardrailOutcome::FailOpen)
+				},
+				FailureMode::FailClosed => Err(e),
+			},
+		}
+	}
+
+	async fn evaluate_straiker_response(
+		resp: &mut dyn ResponseType,
+		http_headers: &HeaderMap,
+		client: &PolicyClient,
+		straiker: &Straiker,
+		rejection: &RequestRejection,
+	) -> anyhow::Result<GuardrailOutcome<ResponseGuardMutation>> {
+		match straiker::send_response(resp, client, straiker, http_headers).await {
+			Ok(v) if v.is_block() => Ok(GuardrailOutcome::Rejected(rejection.as_response())),
+			Ok(_) => Ok(GuardrailOutcome::None),
+			Err(e) => match straiker.failure_mode {
+				FailureMode::FailOpen => {
+					warn!("straiker guardrail unavailable, failing open: {}", e);
+					Ok(GuardrailOutcome::FailOpen)
+				},
+				FailureMode::FailClosed => Err(e),
+			},
 		}
 	}
 
@@ -1599,6 +1643,9 @@ impl Policy {
 				Self::evaluate_azure_content_safety_response(resp, None, client, acs, &guard.rejection)
 					.await
 			},
+			ResponseGuardKind::Straiker(st) => {
+				Self::evaluate_straiker_response(resp, http_headers, client, st, &guard.rejection).await
+			},
 		}
 	}
 }
@@ -1688,6 +1735,8 @@ pub enum RequestGuardKind {
 	GoogleModelArmor(GoogleModelArmor),
 	/// Use Azure Content Safety to evaluate the prompt.
 	AzureContentSafety(AzureContentSafety),
+	/// Use Straiker DefendAI runtime guardrails to evaluate the prompt.
+	Straiker(Straiker),
 }
 
 impl RequestGuardKind {
@@ -1699,6 +1748,7 @@ impl RequestGuardKind {
 			RequestGuardKind::BedrockGuardrails(_) => "bedrockGuardrails",
 			RequestGuardKind::GoogleModelArmor(_) => "googleModelArmor",
 			RequestGuardKind::AzureContentSafety(_) => "azureContentSafety",
+			RequestGuardKind::Straiker(_) => "straiker",
 		}
 	}
 }
@@ -1832,6 +1882,43 @@ pub struct Moderation {
 		schemars(with = "Option<crate::types::local::SimpleLocalBackendPolicies>")
 	)]
 	pub policies: Vec<BackendTrafficPolicy>,
+}
+
+/// Configuration for the Straiker DefendAI guardrail.
+///
+/// Scores prompts and completions against the tenant's Straiker runtime guardrail policy
+/// by calling the Straiker Detect API directly. The `api_key` selects the tenant + app, so a
+/// customer configures this guard entirely in the UI by pasting their own Straiker key.
+#[apply(schema!)]
+pub struct Straiker {
+	/// Straiker Defend application key (sent as a Bearer token). Selects the tenant and app.
+	pub api_key: Strng,
+	/// Straiker API base URL. Defaults to `https://api.prod.straiker.ai`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub base_url: Option<Strng>,
+	/// Application name for Console auto-enumeration (`metadata.source`). A request
+	/// `x-straiker-source` header overrides this per call.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub source: Option<Strng>,
+	/// Behaviour when Straiker is unreachable. Defaults to `failOpen` so a guardrail
+	/// outage never takes down live traffic.
+	#[serde(default = "straiker_fail_open")]
+	pub failure_mode: FailureMode,
+	/// Backend policies used when calling Straiker (TLS, etc.).
+	#[serde(
+		default,
+		deserialize_with = "crate::types::local::de_from_local_backend_policy",
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "Option<crate::types::local::SimpleLocalBackendPolicies>")
+	)]
+	pub policies: Vec<BackendTrafficPolicy>,
+}
+
+fn straiker_fail_open() -> FailureMode {
+	FailureMode::FailOpen
 }
 
 /// Configuration for AWS Bedrock Guardrails integration.
@@ -1994,6 +2081,8 @@ pub enum ResponseGuardKind {
 	GoogleModelArmor(GoogleModelArmor),
 	/// Use Azure Content Safety to evaluate the response.
 	AzureContentSafety(AzureContentSafety),
+	/// Use Straiker DefendAI runtime guardrails to evaluate the response.
+	Straiker(Straiker),
 }
 
 #[apply(schema!)]

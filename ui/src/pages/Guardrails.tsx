@@ -5,6 +5,7 @@ import azureIcon from '@/assets/providers/azure.svg';
 import bedrockIcon from '@/assets/providers/bedrock.svg';
 import googleCloudIcon from '@/assets/providers/googlecloud.svg';
 import openAiIcon from '@/assets/providers/openai.svg';
+import straikerIcon from '@/assets/providers/straiker.svg';
 import { CloudRegionCombobox } from '@/components/CloudRegionCombobox';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
 import { EnumSelector, type EnumSelectorOption } from '@/components/EnumSelector';
@@ -30,6 +31,7 @@ import type {
 	RegexRules,
 	RequestRejection,
 	RequestRejection1,
+	Straiker,
 	Webhook
 } from '@/gateway-config';
 import { useDeleteConfigResource, useLlmConfigData, useUpsertPolicyResource } from '@/hooks';
@@ -47,7 +49,8 @@ type GuardKind =
 	| 'openAIModeration'
 	| 'bedrockGuardrails'
 	| 'googleModelArmor'
-	| 'azureContentSafety';
+	| 'azureContentSafety'
+	| 'straiker';
 type GuardDraftBase = {
 	kind: GuardKind;
 	rejectionStatus: string;
@@ -99,6 +102,13 @@ type AzureContentSafetyGuardDraft = GuardDraftBase & {
 	detectJailbreak: boolean;
 	jailbreakApiVersion: string;
 };
+type StraikerGuardDraft = GuardDraftBase & {
+	kind: 'straiker';
+	apiKey: string;
+	source: string;
+	baseUrl: string;
+	failureMode: 'failClosed' | 'failOpen';
+};
 type GuardDraft =
 	| UnsupportedGuardDraft
 	| BuiltinGuardDraft
@@ -107,7 +117,8 @@ type GuardDraft =
 	| OpenAIModerationGuardDraft
 	| BedrockGuardDraft
 	| GoogleModelArmorGuardDraft
-	| AzureContentSafetyGuardDraft;
+	| AzureContentSafetyGuardDraft
+	| StraikerGuardDraft;
 type SupportedGuardDraft = Exclude<GuardDraft, UnsupportedGuardDraft>;
 type RegexRulesShape = {
 	action?: 'mask' | 'reject';
@@ -168,6 +179,12 @@ const requestGuardKinds: Array<EnumSelectorOption<GuardKind>> = [
 		label: 'Azure Content Safety',
 		description: 'Use Azure AI Content Safety.',
 		icon: <GuardrailProviderIcon src={azureIcon} alt="" />
+	},
+	{
+		value: 'straiker',
+		label: 'Straiker',
+		description: 'Straiker DefendAI runtime guardrails (prompt injection, jailbreak, PII, misuse).',
+		icon: <GuardrailProviderIcon src={straikerIcon} alt="" />
 	}
 ];
 
@@ -670,6 +687,9 @@ function GuardFields(props: {
 			{props.guard.kind === 'webhook' ? (
 				<WebhookGuardFields help={props.help} guard={props.guard} onChange={patch} />
 			) : null}
+			{props.guard.kind === 'straiker' ? (
+				<StraikerGuardFields help={props.help} guard={props.guard} onChange={patch} />
+			) : null}
 			{props.guard.kind === 'openAIModeration' ? (
 				<OpenAIModerationFields help={props.help} guard={props.guard} onChange={patch} />
 			) : null}
@@ -863,6 +883,69 @@ function WebhookGuardFields(props: {
 						props.onChange({
 							failureMode: value
 						} as Partial<SupportedGuardDraft>)
+					}
+				/>
+			</FieldGroup>
+		</>
+	);
+}
+
+function StraikerGuardFields(props: {
+	help: SchemaHelp;
+	guard: StraikerGuardDraft;
+	onChange: (next: Partial<SupportedGuardDraft>) => void;
+}) {
+	return (
+		<>
+			<Field
+				label="Straiker API key"
+				tooltip={props.help.field<Straiker>('Straiker', 'apiKey')}
+				hint="Your Straiker Defend application key. Detections land in your Straiker tenant."
+			>
+				<input
+					type="password"
+					value={props.guard.apiKey}
+					onChange={event =>
+						props.onChange({ apiKey: event.target.value } as Partial<SupportedGuardDraft>)
+					}
+					placeholder="s6r_live_…"
+				/>
+			</Field>
+			<Field
+				label="Application name"
+				tooltip={props.help.field<Straiker>('Straiker', 'source')}
+				hint="Optional. Names this app in your Straiker Console (auto-enumerates)."
+			>
+				<input
+					value={props.guard.source}
+					onChange={event =>
+						props.onChange({ source: event.target.value } as Partial<SupportedGuardDraft>)
+					}
+					placeholder="my-chatbot"
+				/>
+			</Field>
+			<FieldGroup
+				label="Failure mode"
+				tooltip={props.help.field<Straiker>('Straiker', 'failureMode')}
+			>
+				<EnumSelector
+					ariaLabel="Failure mode"
+					value={props.guard.failureMode}
+					options={[
+						{
+							value: 'failOpen',
+							label: 'Fail open',
+							description: 'Continue when Straiker is unavailable (recommended).'
+						},
+						{
+							value: 'failClosed',
+							label: 'Fail closed',
+							description: 'Reject when Straiker is unavailable.'
+						}
+					]}
+					schema={props.help.node(['$defs', 'Straiker', 'properties', 'failureMode'])}
+					onChange={value =>
+						props.onChange({ failureMode: value } as Partial<SupportedGuardDraft>)
 					}
 				/>
 			</FieldGroup>
@@ -1287,6 +1370,20 @@ function draftsFromGuard(guard: GuardObject): GuardDraft[] {
 			}
 		];
 	}
+	if ('straiker' in guard && guard.straiker && typeof guard.straiker === 'object') {
+		const st = guard.straiker as Record<string, unknown>;
+		return [
+			{
+				...base,
+				kind: 'straiker',
+				apiKey: String(st.apiKey ?? ''),
+				source: String(st.source ?? ''),
+				baseUrl: String(st.baseUrl ?? ''),
+				failureMode: st.failureMode === 'failClosed' ? 'failClosed' : 'failOpen',
+				policies: st.policies
+			}
+		];
+	}
 	if (
 		'bedrockGuardrails' in guard &&
 		guard.bedrockGuardrails &&
@@ -1390,6 +1487,16 @@ function buildGuard(guard: GuardDraft): GuardObject {
 					policies: guard.policies
 				})
 			});
+		case 'straiker':
+			return withRejection(guard, {
+				straiker: cleanEmpty({
+					apiKey: guard.apiKey.trim(),
+					source: guard.source.trim() || undefined,
+					baseUrl: guard.baseUrl.trim() || undefined,
+					failureMode: guard.failureMode === 'failOpen' ? undefined : guard.failureMode,
+					policies: guard.policies
+				})
+			});
 		case 'bedrockGuardrails':
 			return withRejection(guard, {
 				bedrockGuardrails: cleanEmpty({
@@ -1476,6 +1583,8 @@ function emptyGuardDraft(kind: GuardKind = 'builtin'): SupportedGuardDraft {
 			return { ...base, kind, target: '', failureMode: 'failClosed' };
 		case 'openAIModeration':
 			return { ...base, kind, model: '' };
+		case 'straiker':
+			return { ...base, kind, apiKey: '', source: '', baseUrl: '', failureMode: 'failOpen' };
 		case 'bedrockGuardrails':
 			return {
 				...base,
@@ -1607,6 +1716,10 @@ function guardSummary(guard: GuardDraft) {
 			return guard.model.trim()
 				? `Model ${guard.model.trim()}.${rejection}`
 				: `Default moderation model.${rejection}`;
+		case 'straiker':
+			return guard.apiKey.trim()
+				? `Straiker${guard.source.trim() ? ` · ${guard.source.trim()}` : ''} · ${guard.failureMode === 'failOpen' ? 'fail open' : 'fail closed'}.${rejection}`
+				: `Straiker key not set.${rejection}`;
 		case 'bedrockGuardrails':
 			return (
 				[guard.guardrailIdentifier, guard.guardrailVersion, guard.region]
